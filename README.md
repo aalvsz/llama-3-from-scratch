@@ -2509,4 +2509,5 @@ This implementation follows the Llama 3 Community License Agreement.
 - [Llama 3 Paper](https://arxiv.org/abs/2407.21783)
 - [RoPE: Rotary Position Embedding](https://arxiv.org/abs/2104.09864)
 - [Grouped Query Attention](https://arxiv.org/abs/2305.13245)
+- [Uygar Kurt - Llama 3 Implementation](https://www.youtube.com/watch?v=lrWY4O5kUTY)
 
