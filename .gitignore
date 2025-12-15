@@ -9,3 +9,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.kaggle/kaggle.json
+checkpoints/
+*.pth
+*.pt

@@ -7,7 +7,15 @@ This script demonstrates how to:
 3. Use chat completion for conversational interactions
 """
 
-from inference import Llama
+# For use as a module
+try:
+    from .inference import Llama
+except ImportError:
+    # For use as a standalone script
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from src.inference import Llama
 
 # Configuration for model loading
 # Update these paths to point to your model checkpoint and tokenizer

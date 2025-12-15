@@ -10,7 +10,7 @@ rotary embeddings to query and key tensors.
 """
 
 import torch
-from config import HEAD_DIM, MAX_SEQ_LEN, ROPE_THETA
+from .config import HEAD_DIM, MAX_SEQ_LEN, ROPE_THETA
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:

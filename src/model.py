@@ -13,7 +13,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from config import (
+from .config import (
     DIM,
     FFN_DIM,
     N_LAYERS,
@@ -27,7 +27,7 @@ from config import (
     N_KV_HEAD_REP,
     ROPE_THETA,
 )
-from rope import precompute_freqs_cis, apply_rotary_emb
+from .rope import precompute_freqs_cis, apply_rotary_emb
 
 
 class RMSNorm(nn.Module):
@@ -291,7 +291,7 @@ class Attention(nn.Module):
         out = out.transpose(1, 2).contiguous()
         
         # Flatten heads: (batch, seq_len, N_HEADS, HEAD_DIM) -> (batch, seq_len, N_HEADS * HEAD_DIM)
-        # The -1 in view() automatically computes N_HEADS * HEAD_DIM = DIM
+        # The -1 in view() automatically computes N_HEADS * HEAD_DIM = DIM (it puts everything in a single dimension)
         out = out.view(bsz, seqlen, -1)
         
         # Apply output projection to combine all heads

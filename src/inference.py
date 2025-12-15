@@ -19,9 +19,9 @@ from typing import List, Optional, Tuple, TypedDict
 import torch
 import torch.nn.functional as F
 
-from config import MAX_BATCH_SIZE, MAX_SEQ_LEN, VOCAB_SIZE
-from model import Transformer
-from tokenizer import Tokenizer, ChatFormat, Dialog, Message
+from .config import MAX_BATCH_SIZE, MAX_SEQ_LEN, VOCAB_SIZE
+from .model import Transformer
+from .tokenizer import Tokenizer, ChatFormat, Dialog, Message
 
 
 class CompletionPrediction(TypedDict, total=False):
