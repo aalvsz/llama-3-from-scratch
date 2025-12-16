@@ -136,23 +136,51 @@ class Llama:
         # Verify that the tokenizer vocabulary size matches our configuration
         assert VOCAB_SIZE == tokenizer.n_words
         
-        # Set default tensor type based on GPU capabilities
-        # BFloat16 is preferred for modern GPUs (better performance)
-        # Half precision (FP16) is used as fallback for older GPUs
-        if torch.cuda.is_bf16_supported():
-            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-        else:
-            torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        # Clear GPU memory before model initialization to prevent OOM errors
+        # This is especially important when running in notebooks where cells may be re-executed
+        if torch.cuda.is_available():
+            # Report current memory usage
+            allocated = torch.cuda.memory_allocated(0)
+            reserved = torch.cuda.memory_reserved(0)
+            total = torch.cuda.get_device_properties(0).total_memory
+            free = total - allocated
+            
+            if allocated > 0:
+                print(f"GPU memory before cleanup: {allocated / 1024**3:.2f} GB allocated, "
+                      f"{reserved / 1024**3:.2f} GB reserved, {free / 1024**3:.2f} GB free")
+            
+            # Clear cache and run garbage collection
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            
+            # Report memory after cleanup
+            allocated_after = torch.cuda.memory_allocated(0)
+            free_after = total - allocated_after
+            if allocated_after < allocated:
+                print(f"GPU memory after cleanup: {allocated_after / 1024**3:.2f} GB allocated, "
+                      f"{free_after / 1024**3:.2f} GB free")
+                print()
         
-        # Initialize the transformer model
+        # Initialize the transformer model on CPU to avoid OOM during initialization
+        # Model will be moved to GPU after loading weights
         model = Transformer()
         
         # Print the total number of parameters in the model
         print(f"PARAMETERS: {sum(p.numel() for p in model.parameters())}")
         
-        # Load the checkpoint weights into the model
+        # Load the checkpoint weights into the model (on CPU)
         # strict=False allows loading even if some keys don't match (for flexibility)
         model.load_state_dict(checkpoint, strict=False)
+        
+        # Move model to GPU and convert to appropriate dtype
+        # This is more memory-efficient than initializing directly on GPU
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{local_rank}")
+            # Use bfloat16 for modern GPUs, float16 as fallback
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            model = model.to(device=device, dtype=dtype)
+            print(f"Model moved to GPU {local_rank} with dtype {dtype}")
         
         # Print the time taken to load the model
         print(f"Loaded in {time.time() - start_time:.2f} seconds")

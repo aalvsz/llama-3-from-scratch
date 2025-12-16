@@ -182,27 +182,11 @@ class Attention(nn.Module):
         # This combines all attention heads back into a single vector
         self.wo = nn.Linear(N_HEADS * HEAD_DIM, DIM, bias=False)
 
-        # Create empty KV cache tensors for efficient autoregressive generation
-        # These store previously computed keys and values to avoid recomputation
+        # KV cache tensors will be lazily initialized on first forward pass
+        # This avoids allocating large tensors during model initialization
         # Shape: (MAX_BATCH_SIZE, MAX_SEQ_LEN, N_KV_HEADS, HEAD_DIM)
-        self.cache_k = torch.zeros(
-            (
-                MAX_BATCH_SIZE,  # Maximum batch size
-                MAX_SEQ_LEN,     # Maximum sequence length
-                N_KV_HEADS,      # Number of key-value heads
-                HEAD_DIM,        # Dimension per head
-            )
-        )
-        
-        # Value cache: same shape as key cache
-        self.cache_v = torch.zeros(
-            (
-                MAX_BATCH_SIZE,
-                MAX_SEQ_LEN,
-                N_KV_HEADS,
-                HEAD_DIM,
-            )
-        )
+        self.cache_k = None
+        self.cache_v = None
 
     def forward(
         self, 
@@ -242,9 +226,36 @@ class Attention(nn.Module):
         # This encodes positional information into the attention mechanism
         queries, keys = apply_rotary_emb(queries, keys, freqs_cis=freqs_cis)
 
-        # Move cache to the same device as queries (CPU -> GPU if needed)
-        self.cache_k = self.cache_k.to(queries.device)
-        self.cache_v = self.cache_v.to(queries.device)
+        # Lazy initialization of KV cache tensors on first forward pass
+        # This avoids allocating large tensors during model initialization
+        if self.cache_k is None:
+            self.cache_k = torch.zeros(
+                (
+                    MAX_BATCH_SIZE,
+                    MAX_SEQ_LEN,
+                    N_KV_HEADS,
+                    HEAD_DIM,
+                ),
+                dtype=queries.dtype,
+                device=queries.device,
+            )
+        if self.cache_v is None:
+            self.cache_v = torch.zeros(
+                (
+                    MAX_BATCH_SIZE,
+                    MAX_SEQ_LEN,
+                    N_KV_HEADS,
+                    HEAD_DIM,
+                ),
+                dtype=queries.dtype,
+                device=queries.device,
+            )
+        
+        # Ensure cache is on the same device as queries (for CPU->GPU migration)
+        if self.cache_k.device != queries.device:
+            self.cache_k = self.cache_k.to(queries.device)
+        if self.cache_v.device != queries.device:
+            self.cache_v = self.cache_v.to(queries.device)
 
         # Update KV cache with new keys and values
         # Store the computed keys/values at positions [start_pos : start_pos + seqlen]
