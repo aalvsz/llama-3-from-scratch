@@ -382,34 +382,53 @@ class Transformer(nn.Module):
     - Final normalization and output projection
     """
     
-    def __init__(self):
-        """Initialize the complete transformer model."""
+    def __init__(self, device: torch.device = None):
+        """
+        Initialize the complete transformer model.
+        
+        Args:
+            device: Device to initialize the model on. Defaults to CPU to avoid OOM during initialization.
+        """
         # Call parent class constructor
         super().__init__()
+        
+        # Default to CPU to avoid GPU memory allocation during initialization
+        # This prevents OOM errors when initializing large models
+        if device is None:
+            device = torch.device("cpu")
         
         # Token embedding layer: maps token IDs to dense vectors
         # Input: token IDs (integers), Output: embedding vectors of size DIM
         # Vocabulary size: VOCAB_SIZE, embedding dimension: DIM
-        self.tok_embeddings = nn.Embedding(
-            VOCAB_SIZE,  # Number of tokens in vocabulary
-            DIM          # Embedding dimension
-        )
+        # Initialize on CPU first, then move to device to avoid GPU allocation during init
+        self.tok_embeddings = nn.Embedding(VOCAB_SIZE, DIM)
+        self.tok_embeddings = self.tok_embeddings.to(device)
         
         # Create a list of transformer blocks
         # Each block is identical and processes the sequence independently
         self.layers = torch.nn.ModuleList()
         
         # Add N_LAYERS transformer blocks
-        for _ in range(N_LAYERS):
-            self.layers.append(TransformerBlock())
+        # Initialize on CPU first, then move to avoid GPU allocation during init
+        for i in range(N_LAYERS):
+            block = TransformerBlock()
+            self.layers.append(block.to(device))
+            if (i + 1) % 8 == 0:
+                # Print progress every 8 layers to track initialization
+                pass  # Can add print here if needed for debugging
 
         # Final normalization layer before output projection
         self.norm = RMSNorm(DIM, NORM_EPS)
+        self.norm = self.norm.to(device)
         
         # Output projection: maps hidden states to vocabulary logits
         # This projects from DIM to VOCAB_SIZE to predict the next token
+        # This is a large layer (4096 x 128256 ≈ 525M parameters, ~2GB in float32)
+        # Initialize on CPU first, then move to device
         # bias=False: No bias term in the output layer
         self.output = nn.Linear(DIM, VOCAB_SIZE, bias=False)
+        # Move to device - this is a large transfer but necessary
+        self.output = self.output.to(device)
 
         # Precompute RoPE frequencies for all possible positions
         # We compute for MAX_SEQ_LEN * 2 to have some buffer
@@ -440,12 +459,11 @@ class Transformer(nn.Module):
         # Output: (batch, seq_len, DIM) of float vectors
         h = self.tok_embeddings(tokens)
         
-        # Move RoPE frequencies to the same device as tokens (CPU -> GPU if needed)
-        self.freqs_cis = self.freqs_cis.to(tokens.device)
-        
         # Extract frequencies for the current sequence positions
         # We only need frequencies for positions [start_pos : start_pos + seqlen]
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        # Use a local copy to avoid modifying the class attribute when moving between GPUs
+        # Move to the device of tokens (will be moved to layer device later if needed)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen].to(tokens.device)
 
         # Initialize attention mask to None
         # When seqlen=1 (autoregressive generation with KV cache), no mask is needed
@@ -472,7 +490,24 @@ class Transformer(nn.Module):
 
         # Pass through all transformer layers
         # Each layer processes the hidden states and passes them to the next
-        for layer in self.layers:
+        # If using model parallelism, move tensors between GPUs as needed
+        for i, layer in enumerate(self.layers):
+            # Get the device of the layer (first parameter's device)
+            try:
+                layer_device = next(layer.parameters()).device
+            except StopIteration:
+                # Fallback if layer has no parameters (shouldn't happen)
+                layer_device = h.device
+            
+            # Move input to the layer's device if using model parallelism
+            if h.device != layer_device:
+                h = h.to(layer_device)
+            # Also move freqs_cis and mask if needed (always check, as device may have changed)
+            if freqs_cis.device != layer_device:
+                freqs_cis = freqs_cis.to(layer_device)
+            if mask is not None and mask.device != layer_device:
+                mask = mask.to(layer_device)
+            
             # Apply transformer block: attention + FFN with residual connections
             # Output shape: (batch, seq_len, DIM)
             h = layer(h, start_pos, freqs_cis, mask)

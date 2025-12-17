@@ -19,7 +19,7 @@ from typing import List, Optional, Tuple, TypedDict
 import torch
 import torch.nn.functional as F
 
-from .config import MAX_BATCH_SIZE, MAX_SEQ_LEN, VOCAB_SIZE
+from .config import MAX_BATCH_SIZE, MAX_SEQ_LEN, VOCAB_SIZE, N_LAYERS
 from .model import Transformer
 from .tokenizer import Tokenizer, ChatFormat, Dialog, Message
 
@@ -100,8 +100,14 @@ class Llama:
         # Get local rank for distributed training (defaults to 0 for single GPU)
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         
-        # Set the CUDA device to use
-        torch.cuda.set_device(local_rank)
+        # Set the CUDA device to use (only if CUDA is available)
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(local_rank)
+            except Exception as e:
+                print(f"Warning: Could not set CUDA device {local_rank}: {e}")
+                local_rank = 0
+        # Note: MPS (Metal Performance Shaders) for Apple Silicon doesn't need explicit device setting
 
         # Set random seed for reproducibility
         # Seed must be the same in all processes for distributed training
@@ -139,48 +145,153 @@ class Llama:
         # Clear GPU memory before model initialization to prevent OOM errors
         # This is especially important when running in notebooks where cells may be re-executed
         if torch.cuda.is_available():
-            # Report current memory usage
-            allocated = torch.cuda.memory_allocated(0)
-            reserved = torch.cuda.memory_reserved(0)
-            total = torch.cuda.get_device_properties(0).total_memory
-            free = total - allocated
+            # Report current memory usage for all GPUs
+            num_gpus = torch.cuda.device_count()
+            for gpu_id in range(num_gpus):
+                allocated = torch.cuda.memory_allocated(gpu_id)
+                reserved = torch.cuda.memory_reserved(gpu_id)
+                total = torch.cuda.get_device_properties(gpu_id).total_memory
+                free = total - allocated
+                
+                if allocated > 0:
+                    print(f"GPU {gpu_id} memory before cleanup: {allocated / 1024**3:.2f} GB allocated, "
+                          f"{reserved / 1024**3:.2f} GB reserved, {free / 1024**3:.2f} GB free")
             
-            if allocated > 0:
-                print(f"GPU memory before cleanup: {allocated / 1024**3:.2f} GB allocated, "
-                      f"{reserved / 1024**3:.2f} GB reserved, {free / 1024**3:.2f} GB free")
-            
-            # Clear cache and run garbage collection
-            torch.cuda.empty_cache()
+            # Clear cache on all GPUs and run garbage collection
+            for gpu_id in range(num_gpus):
+                with torch.cuda.device(gpu_id):
+                    torch.cuda.empty_cache()
             import gc
             gc.collect()
             
             # Report memory after cleanup
-            allocated_after = torch.cuda.memory_allocated(0)
-            free_after = total - allocated_after
-            if allocated_after < allocated:
-                print(f"GPU memory after cleanup: {allocated_after / 1024**3:.2f} GB allocated, "
-                      f"{free_after / 1024**3:.2f} GB free")
-                print()
+            for gpu_id in range(num_gpus):
+                allocated_after = torch.cuda.memory_allocated(gpu_id)
+                total = torch.cuda.get_device_properties(gpu_id).total_memory
+                free_after = total - allocated_after
+                if allocated_after > 0:
+                    print(f"GPU {gpu_id} memory after cleanup: {allocated_after / 1024**3:.2f} GB allocated, "
+                          f"{free_after / 1024**3:.2f} GB free")
+            print()
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            # MPS (Metal Performance Shaders) for Apple Silicon
+            import gc
+            gc.collect()
+            print("MPS (Metal) available - memory will be managed automatically")
+            print()
         
         # Initialize the transformer model on CPU to avoid OOM during initialization
+        # Explicitly use CPU device to prevent any GPU allocation during initialization
         # Model will be moved to GPU after loading weights
-        model = Transformer()
+        print("Initializing model on CPU...")
+        cpu_device = torch.device("cpu")
+        
+        try:
+            model = Transformer(device=cpu_device)
+            print("✓ Model initialized on CPU")
+        except Exception as e:
+            print(f"❌ Error initializing model: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
         
         # Print the total number of parameters in the model
-        print(f"PARAMETERS: {sum(p.numel() for p in model.parameters())}")
+        try:
+            param_count = sum(p.numel() for p in model.parameters())
+            print(f"PARAMETERS: {param_count:,}")
+        except Exception as e:
+            print(f"Warning: Could not count parameters: {e}")
         
         # Load the checkpoint weights into the model (on CPU)
         # strict=False allows loading even if some keys don't match (for flexibility)
-        model.load_state_dict(checkpoint, strict=False)
+        print("Loading checkpoint weights...")
+        try:
+            model.load_state_dict(checkpoint, strict=False)
+            print("✓ Checkpoint loaded")
+        except Exception as e:
+            print(f"❌ Error loading checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
         
-        # Move model to GPU and convert to appropriate dtype
+        # Move model to GPU/MPS and convert to appropriate dtype
         # This is more memory-efficient than initializing directly on GPU
         if torch.cuda.is_available():
+            # Determine device and dtype
             device = torch.device(f"cuda:{local_rank}")
             # Use bfloat16 for modern GPUs, float16 as fallback
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            
+            # If model parallelism is requested, split layers across GPUs
+            if model_parallel_size is not None and model_parallel_size > 1:
+                num_gpus = min(model_parallel_size, torch.cuda.device_count())
+                if num_gpus < 2:
+                    print(f"Warning: model_parallel_size={model_parallel_size} requested but only {torch.cuda.device_count()} GPU(s) available. Using single GPU.")
+                    model = model.to(device=device, dtype=dtype)
+                    print(f"Model moved to GPU {local_rank} with dtype {dtype}")
+                else:
+                    print(f"Using model parallelism across {num_gpus} GPUs")
+                    
+                    # Move embedding and output to first GPU
+                    try:
+                        model.tok_embeddings = model.tok_embeddings.to(device=device, dtype=dtype)
+                        model.norm = model.norm.to(device=device, dtype=dtype)
+                        model.output = model.output.to(device=device, dtype=dtype)
+                        
+                        # Distribute layers across GPUs
+                        layers_per_gpu = (N_LAYERS + num_gpus - 1) // num_gpus
+                        for i, layer in enumerate(model.layers):
+                            gpu_id = min(i // layers_per_gpu, num_gpus - 1)
+                            layer_device = torch.device(f"cuda:{gpu_id}")
+                            model.layers[i] = layer.to(device=layer_device, dtype=dtype)
+                            if i == 0 or (i + 1) % layers_per_gpu == 0 or i == N_LAYERS - 1:
+                                end_layer = min(i + layers_per_gpu - 1, N_LAYERS - 1)
+                                print(f"  Layers {i}-{end_layer} on GPU {gpu_id}")
+                    except RuntimeError as e:
+                        print(f"Error during model parallelism setup: {e}")
+                        print("Falling back to single GPU mode...")
+                        # Fallback to single GPU
+                        model = model.to(device=device, dtype=dtype)
+                        print(f"Model moved to GPU {local_rank} with dtype {dtype}")
+            else:
+                # Single GPU: move entire model
+                try:
+                    model = model.to(device=device, dtype=dtype)
+                    print(f"Model moved to GPU {local_rank} with dtype {dtype}")
+                except RuntimeError as e:
+                    print(f"Error moving model to GPU: {e}")
+                    print("This might be an out-of-memory error. Try:")
+                    print("  1. Reducing max_seq_len or max_batch_size")
+                    print("  2. Using model_parallel_size=2 to split across GPUs")
+                    raise
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            # MPS (Metal Performance Shaders) for Apple Silicon (M1/M2/M3)
+            device = torch.device("mps")
+            # MPS supports float32 and float16, but bfloat16 support varies by macOS version
+            # Use float16 for better performance on Apple Silicon
+            dtype = torch.float16
+            print(f"Using MPS (Metal) device on Apple Silicon")
+            
+            # MPS doesn't support model parallelism across multiple GPUs
+            if model_parallel_size is not None and model_parallel_size > 1:
+                print(f"Warning: model_parallel_size={model_parallel_size} requested but MPS doesn't support multi-GPU parallelism. Using single device.")
+            
+            try:
+                model = model.to(device=device, dtype=dtype)
+                print(f"Model moved to MPS device with dtype {dtype}")
+            except RuntimeError as e:
+                print(f"Error moving model to MPS: {e}")
+                print("This might be an out-of-memory error. Try:")
+                print("  1. Reducing max_seq_len or max_batch_size")
+                print("  2. Using CPU instead (slower but more memory available)")
+                raise
+        else:
+            # Fallback to CPU
+            device = torch.device("cpu")
+            dtype = torch.float32  # CPU typically uses float32
+            print("No GPU/MPS available - using CPU (this will be slow)")
             model = model.to(device=device, dtype=dtype)
-            print(f"Model moved to GPU {local_rank} with dtype {dtype}")
+            print(f"Model moved to CPU with dtype {dtype}")
         
         # Print the time taken to load the model
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
@@ -252,15 +363,18 @@ class Llama:
         # Get padding token ID (not used, but needed for tensor initialization)
         pad_id = self.tokenizer.pad_id
         
+        # Get the device of the model's embedding layer (first GPU in model parallelism)
+        model_device = next(self.model.tok_embeddings.parameters()).device
+        
         # Create tensor to store all tokens (prompt + generated)
         # Initialize with padding tokens
         # Shape: (batch_size, total_len)
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=model_device)
         
         # Fill in the prompt tokens
         for k, t in enumerate(prompt_tokens):
             # Copy prompt tokens into the tensor
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=model_device)
         
         # Initialize log probabilities tensor if requested
         if logprobs:
@@ -270,7 +384,7 @@ class Llama:
         prev_pos = 0
         
         # Track which sequences have reached end-of-sequence
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        eos_reached = torch.tensor([False] * bsz, device=model_device)
         
         # Create mask to identify which positions contain prompt tokens (not padding)
         input_text_mask = tokens != pad_id
@@ -289,7 +403,7 @@ class Llama:
             )
 
         # Convert stop tokens to tensor for efficient checking
-        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
+        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens), device=model_device)
 
         # Autoregressive generation loop
         # Generate one token at a time until max length or all sequences stop

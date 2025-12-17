@@ -1,0 +1,41 @@
+# Python virtual environment
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Model checkpoints and weights
+checkpoints/
+*.pth
+*.pt
+*.safetensors
+*.bin
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Git directory (large pack files)
+.git/objects/pack/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+
