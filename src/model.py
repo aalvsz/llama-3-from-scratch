@@ -92,6 +92,10 @@ class RMSNorm(nn.Module):
         Returns:
             Normalized and scaled tensor of the same shape
         """
+        # Ensure input is on the same device as the normalization weights
+        if x.device != self.weight.device:
+            x = x.to(self.weight.device)
+
         # Normalize the input
         # Convert to float32 for numerical stability during normalization
         # Then convert back to original dtype (e.g., bfloat16)
