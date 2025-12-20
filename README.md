@@ -29,13 +29,17 @@ The model follows the Llama 3 architecture specifications:
 
 ```
 llama-3-from-scratch/
-├── config.py          # Model hyperparameters and constants
-├── rope.py            # Rotary Position Embedding utilities
-├── model.py           # Model architecture (RMSNorm, FFN, Attention, Transformer)
-├── tokenizer.py       # Tokenizer and chat formatting
-├── inference.py       # Text generation and inference
-├── example.py         # Usage examples
-└── README.md          # This file
+├── notebooks/
+│   └── inference.ipynb   # Minimal inference walkthrough
+├── src/
+│   ├── config.py         # Model hyperparameters and constants
+│   ├── rope.py           # Rotary Position Embedding utilities
+│   ├── model.py          # Model architecture (RMSNorm, FFN, Attention, Transformer)
+│   ├── tokenizer.py      # Tokenizer and chat formatting
+│   ├── inference.py      # Text generation and inference
+│   └── example.py        # Usage examples
+├── requirements.txt
+└── README.md             # This file
 ```
 
 ## Architecture Diagram
@@ -2510,4 +2514,3 @@ This implementation follows the Llama 3 Community License Agreement.
 - [RoPE: Rotary Position Embedding](https://arxiv.org/abs/2104.09864)
 - [Grouped Query Attention](https://arxiv.org/abs/2305.13245)
 - [Uygar Kurt - Llama 3 Implementation](https://www.youtube.com/watch?v=lrWY4O5kUTY)
-
