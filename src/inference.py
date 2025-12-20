@@ -24,6 +24,58 @@ from .model import Transformer
 from .tokenizer import Tokenizer, ChatFormat, Dialog, Message
 
 
+def _hf_to_meta_key(key: str) -> str:
+    if key.startswith("model."):
+        key = key[len("model.") :]
+    key = key.replace("self_attn.q_proj", "attention.wq")
+    key = key.replace("self_attn.k_proj", "attention.wk")
+    key = key.replace("self_attn.v_proj", "attention.wv")
+    key = key.replace("self_attn.o_proj", "attention.wo")
+    key = key.replace("mlp.gate_proj", "feed_forward.w1")
+    key = key.replace("mlp.up_proj", "feed_forward.w3")
+    key = key.replace("mlp.down_proj", "feed_forward.w2")
+    key = key.replace("input_layernorm", "attention_norm")
+    key = key.replace("post_attention_layernorm", "ffn_norm")
+    key = key.replace("embed_tokens", "tok_embeddings")
+    key = key.replace("lm_head", "output")
+    return key
+
+
+def _load_safetensors_shards(model: Transformer, shards: List[Path]) -> None:
+    try:
+        from safetensors import safe_open
+    except ImportError as e:
+        raise ImportError(
+            "safetensors is required to load model-*.safetensors files. "
+            "Install it with `pip install safetensors`."
+        ) from e
+
+    state_dict = model.state_dict()
+    loaded = 0
+    skipped = 0
+
+    for shard in shards:
+        with safe_open(str(shard), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                new_key = _hf_to_meta_key(key)
+                if new_key not in state_dict:
+                    skipped += 1
+                    continue
+                tensor = f.get_tensor(key)
+                if tensor.shape != state_dict[new_key].shape:
+                    raise ValueError(
+                        f"Shape mismatch for {new_key}: "
+                        f"checkpoint {tuple(tensor.shape)} vs model {tuple(state_dict[new_key].shape)}"
+                    )
+                state_dict[new_key].copy_(tensor)
+                loaded += 1
+
+    if loaded == 0:
+        raise ValueError("No matching tensors were loaded from safetensors shards.")
+
+    if skipped > 0:
+        print(f"Note: skipped {skipped} unmatched tensors while loading safetensors.")
+
 class CompletionPrediction(TypedDict, total=False):
     """
     Typed dictionary for text completion predictions.
@@ -120,21 +172,23 @@ class Llama:
         # Start timing the loading process
         start_time = time.time()
         
-        # Find all checkpoint files in the directory
-        checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
+        # Identify available checkpoint files
+        consolidated_path = Path(ckpt_dir) / "consolidated.00.pth"
+        safetensors_files = sorted(Path(ckpt_dir).glob("model-*.safetensors"))
         
-        # Verify that at least one checkpoint file exists
-        assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
+        # Verify that at least one checkpoint format exists
+        assert consolidated_path.exists() or safetensors_files, (
+            f"no checkpoint files found in {ckpt_dir} "
+            f"(expected consolidated.00.pth or model-*.safetensors)"
+        )
         
-        # Load the main checkpoint file
-        # consolidated.00.pth contains the model weights
-        # map_location="cpu" loads to CPU first (will be moved to GPU later)
-        checkpoint = torch.load(ckpt_dir + "consolidated.00.pth", map_location="cpu")
-        
-        # Load model parameters from params.json
-        # This file contains hyperparameters and model configuration
-        with open(Path(ckpt_dir) / "params.json", "r") as f:
-            params = json.loads(f.read())
+        # Load model parameters from params.json (optional for inference)
+        params_path = Path(ckpt_dir) / "params.json"
+        if params_path.exists():
+            with open(params_path, "r") as f:
+                _ = json.loads(f.read())
+        else:
+            print(f"Warning: params.json not found in {ckpt_dir}. Continuing without it.")
             
         # Initialize the tokenizer
         tokenizer = Tokenizer(model_path=tokenizer_path)
@@ -206,8 +260,15 @@ class Llama:
         # strict=False allows loading even if some keys don't match (for flexibility)
         print("Loading checkpoint weights...")
         try:
-            model.load_state_dict(checkpoint, strict=False)
-            print("✓ Checkpoint loaded")
+            if consolidated_path.exists():
+                # consolidated.00.pth contains the model weights
+                # map_location="cpu" loads to CPU first (will be moved to GPU later)
+                checkpoint = torch.load(str(consolidated_path), map_location="cpu")
+                model.load_state_dict(checkpoint, strict=False)
+                print("✓ Checkpoint loaded from consolidated.00.pth")
+            else:
+                _load_safetensors_shards(model, safetensors_files)
+                print("✓ Checkpoint loaded from safetensors shards")
         except Exception as e:
             print(f"❌ Error loading checkpoint: {e}")
             import traceback
@@ -676,4 +737,3 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     
     # Return the sampled token indices
     return next_token
-
