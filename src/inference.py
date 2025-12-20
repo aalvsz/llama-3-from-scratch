@@ -283,6 +283,11 @@ class Llama:
             # Use bfloat16 for modern GPUs, float16 as fallback
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             
+            # Default to 2-way model parallelism when 2 GPUs are available
+            if model_parallel_size is None and torch.cuda.device_count() >= 2:
+                model_parallel_size = 2
+                print("Auto-selected model_parallel_size=2 for multi-GPU inference")
+
             # If model parallelism is requested, split layers across GPUs
             if model_parallel_size is not None and model_parallel_size > 1:
                 num_gpus = min(model_parallel_size, torch.cuda.device_count())
