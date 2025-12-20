@@ -235,19 +235,48 @@ class Llama:
             print()
         
         # Initialize the transformer model on CPU to avoid OOM during initialization
-        # Explicitly use CPU device to prevent any GPU allocation during initialization
-        # Model will be moved to GPU after loading weights
+        # Use float16 on CPU when CUDA is available to reduce host RAM footprint
         print("Initializing model on CPU...")
         cpu_device = torch.device("cpu")
-        
+        init_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
         try:
+            prev_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(init_dtype)
             model = Transformer(device=cpu_device)
-            print("✓ Model initialized on CPU")
+            torch.set_default_dtype(prev_dtype)
+            print(f"✓ Model initialized on CPU ({init_dtype})")
         except Exception as e:
+            torch.set_default_dtype(prev_dtype)
             print(f"❌ Error initializing model: {e}")
             import traceback
             traceback.print_exc()
             raise
+
+        # For multi-GPU setups, move the model to GPUs before loading weights
+        # This mirrors the behavior of initializing directly on GPU to reduce CPU RAM usage
+        model_on_gpu = False
+        if torch.cuda.is_available():
+            if model_parallel_size is None and torch.cuda.device_count() >= 2:
+                model_parallel_size = 2
+                print("Auto-selected model_parallel_size=2 for multi-GPU inference")
+
+            if model_parallel_size is not None and model_parallel_size > 1:
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                num_gpus = min(model_parallel_size, torch.cuda.device_count())
+                device0 = torch.device("cuda:0")
+                print(f"Placing model on {num_gpus} GPUs before loading weights...")
+
+                model.tok_embeddings = model.tok_embeddings.to(device=device0, dtype=dtype)
+                model.norm = model.norm.to(device=device0, dtype=dtype)
+                model.output = model.output.to(device=device0, dtype=dtype)
+
+                layers_per_gpu = (N_LAYERS + num_gpus - 1) // num_gpus
+                for i, layer in enumerate(model.layers):
+                    gpu_id = min(i // layers_per_gpu, num_gpus - 1)
+                    layer_device = torch.device(f"cuda:{gpu_id}")
+                    model.layers[i] = layer.to(device=layer_device, dtype=dtype)
+                model_on_gpu = True
         
         # Print the total number of parameters in the model
         try:
@@ -278,58 +307,58 @@ class Llama:
         # Move model to GPU/MPS and convert to appropriate dtype
         # This is more memory-efficient than initializing directly on GPU
         if torch.cuda.is_available():
-            # Determine device and dtype
-            device = torch.device(f"cuda:{local_rank}")
-            # Use bfloat16 for modern GPUs, float16 as fallback
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            
-            # Default to 2-way model parallelism when 2 GPUs are available
-            if model_parallel_size is None and torch.cuda.device_count() >= 2:
-                model_parallel_size = 2
-                print("Auto-selected model_parallel_size=2 for multi-GPU inference")
+            if model_on_gpu:
+                print("Model already placed on GPU(s) before loading weights")
+                device = next(model.tok_embeddings.parameters()).device
+                dtype = next(model.tok_embeddings.parameters()).dtype
+            else:
+                # Determine device and dtype
+                device = torch.device(f"cuda:{local_rank}")
+                # Use bfloat16 for modern GPUs, float16 as fallback
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-            # If model parallelism is requested, split layers across GPUs
-            if model_parallel_size is not None and model_parallel_size > 1:
-                num_gpus = min(model_parallel_size, torch.cuda.device_count())
-                if num_gpus < 2:
-                    print(f"Warning: model_parallel_size={model_parallel_size} requested but only {torch.cuda.device_count()} GPU(s) available. Using single GPU.")
-                    model = model.to(device=device, dtype=dtype)
-                    print(f"Model moved to GPU {local_rank} with dtype {dtype}")
-                else:
-                    print(f"Using model parallelism across {num_gpus} GPUs")
-                    
-                    # Move embedding and output to first GPU
-                    try:
-                        model.tok_embeddings = model.tok_embeddings.to(device=device, dtype=dtype)
-                        model.norm = model.norm.to(device=device, dtype=dtype)
-                        model.output = model.output.to(device=device, dtype=dtype)
-                        
-                        # Distribute layers across GPUs
-                        layers_per_gpu = (N_LAYERS + num_gpus - 1) // num_gpus
-                        for i, layer in enumerate(model.layers):
-                            gpu_id = min(i // layers_per_gpu, num_gpus - 1)
-                            layer_device = torch.device(f"cuda:{gpu_id}")
-                            model.layers[i] = layer.to(device=layer_device, dtype=dtype)
-                            if i == 0 or (i + 1) % layers_per_gpu == 0 or i == N_LAYERS - 1:
-                                end_layer = min(i + layers_per_gpu - 1, N_LAYERS - 1)
-                                print(f"  Layers {i}-{end_layer} on GPU {gpu_id}")
-                    except RuntimeError as e:
-                        print(f"Error during model parallelism setup: {e}")
-                        print("Falling back to single GPU mode...")
-                        # Fallback to single GPU
+                # If model parallelism is requested, split layers across GPUs
+                if model_parallel_size is not None and model_parallel_size > 1:
+                    num_gpus = min(model_parallel_size, torch.cuda.device_count())
+                    if num_gpus < 2:
+                        print(f"Warning: model_parallel_size={model_parallel_size} requested but only {torch.cuda.device_count()} GPU(s) available. Using single GPU.")
                         model = model.to(device=device, dtype=dtype)
                         print(f"Model moved to GPU {local_rank} with dtype {dtype}")
-            else:
-                # Single GPU: move entire model
-                try:
-                    model = model.to(device=device, dtype=dtype)
-                    print(f"Model moved to GPU {local_rank} with dtype {dtype}")
-                except RuntimeError as e:
-                    print(f"Error moving model to GPU: {e}")
-                    print("This might be an out-of-memory error. Try:")
-                    print("  1. Reducing max_seq_len or max_batch_size")
-                    print("  2. Using model_parallel_size=2 to split across GPUs")
-                    raise
+                    else:
+                        print(f"Using model parallelism across {num_gpus} GPUs")
+                        
+                        # Move embedding and output to first GPU
+                        try:
+                            model.tok_embeddings = model.tok_embeddings.to(device=device, dtype=dtype)
+                            model.norm = model.norm.to(device=device, dtype=dtype)
+                            model.output = model.output.to(device=device, dtype=dtype)
+                            
+                            # Distribute layers across GPUs
+                            layers_per_gpu = (N_LAYERS + num_gpus - 1) // num_gpus
+                            for i, layer in enumerate(model.layers):
+                                gpu_id = min(i // layers_per_gpu, num_gpus - 1)
+                                layer_device = torch.device(f"cuda:{gpu_id}")
+                                model.layers[i] = layer.to(device=layer_device, dtype=dtype)
+                                if i == 0 or (i + 1) % layers_per_gpu == 0 or i == N_LAYERS - 1:
+                                    end_layer = min(i + layers_per_gpu - 1, N_LAYERS - 1)
+                                    print(f"  Layers {i}-{end_layer} on GPU {gpu_id}")
+                        except RuntimeError as e:
+                            print(f"Error during model parallelism setup: {e}")
+                            print("Falling back to single GPU mode...")
+                            # Fallback to single GPU
+                            model = model.to(device=device, dtype=dtype)
+                            print(f"Model moved to GPU {local_rank} with dtype {dtype}")
+                else:
+                    # Single GPU: move entire model
+                    try:
+                        model = model.to(device=device, dtype=dtype)
+                        print(f"Model moved to GPU {local_rank} with dtype {dtype}")
+                    except RuntimeError as e:
+                        print(f"Error moving model to GPU: {e}")
+                        print("This might be an out-of-memory error. Try:")
+                        print("  1. Reducing max_seq_len or max_batch_size")
+                        print("  2. Using model_parallel_size=2 to split across GPUs")
+                        raise
         elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             # MPS (Metal Performance Shaders) for Apple Silicon (M1/M2/M3)
             device = torch.device("mps")
