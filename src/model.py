@@ -514,13 +514,18 @@ class Transformer(nn.Module):
         
         # Apply final normalization
         # Output shape: (batch, seq_len, DIM)
+        norm_device = next(self.norm.parameters()).device
+        if h.device != norm_device:
+            h = h.to(norm_device)
         h = self.norm(h)
         
         # Project to vocabulary logits
         # Convert to float32 for numerical stability in softmax
         # Output shape: (batch, seq_len, VOCAB_SIZE)
+        output_device = next(self.output.parameters()).device
+        if h.device != output_device:
+            h = h.to(output_device)
         out = self.output(h).float()
         
         # Return logits over vocabulary
         return out
-
